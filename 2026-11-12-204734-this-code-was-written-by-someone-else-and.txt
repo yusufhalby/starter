@@ -1,0 +1,1883 @@
+
+> <ide_opened_file>The user opened the file c:\Users\Halby\Downloads\تافلم
+   starter\src\server.js in the IDE. This may or may\نيحشرملل لسرت - رابتخالا
+  not be related to the current task.</ide_opened_file>
+
+> This code was written by someone else and
+  It must work on Render, be secure, behave correctly with Meta and Resend,
+  never send a duplicate email, and be tested with a sample message signed with
+  the .env secret as it will run locally.
+  List the problems you find and explain each one.
+
+● I'll read every file in the project first. It's small enough to review
+  directly.
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+● Read every file and checked the installed SDKs (Node 24, Express 4.22, Resend
+  4.8). Writing up the findings and the fix plan now.
+
+● Updated plan
+  ⎿  /plan to preview
+
+● User approved Claude's plan
+  ⎿  Plan saved to: ~\.claude\plans\this-code-was-written-velvety-frost.md ·
+     /plan to edit
+     td-whatsapp-intake: review findings and fix plan
+
+     Context
+
+     The starter (src/server.js, src/handler.js, src/whatsapp.js) receives Meta
+     WhatsApp Cloud API
+     webhooks and emails the client a confirmation through Resend. Someone else
+     wrote it and nobody has reviewed it.
+     Requirements: it runs on Render, it is secure, it behaves correctly with
+     Meta and Resend, it never sends a
+     duplicate email, and it can be tested locally with
+     samples/incoming-message.json signed with the
+     .env secret. Checked against the installed versions: Node 24.18, express
+     4.22.3, resend 4.8.0.
+
+     ---
+
+     Problems found
+
+     A. Security
+
+     1. .env with all secrets is staged for commit (git status: A .env).
+        .gitignore only lists
+        node_modules. After the first commit and push, the app secret, access
+        token and Resend key are in git
+        history for good. → Unstage it, add .env to .gitignore, rotate any real
+        secrets, and set them in the Render dashboard.
+     2. Webhook signature is never checked. META_APP_SECRET is defined but never
+        used. Anyone who finds the URL
+        can POST a fake payload that makes the service email any address with
+        text they choose, sent under
+        the "Top Delmon" name, and send paid WhatsApp messages. Meta signs every
+        POST with
+        X-Hub-Signature-256: sha256=HMAC_SHA256(app_secret, raw_body). The check
+        needs the raw bytes, and
+        express.json() throws them away, so the HMAC can't be computed at all
+        right now.
+     3. HTML injection in the email (handler.js:21). ${name} (the WhatsApp
+        profile name, which the user controls) and
+        ${text} go into the HTML without escaping. A client can inject links,
+        images or fake content
+        into an email sent from your domain, which is a phishing vector.
+     4. Verify-token bypass when the env var is missing (server.js:10). If
+        META_VERIFY_TOKEN is unset,
+        undefined === undefined lets a request with no hub.verify_token pass.
+     5. Open email relay by design. Any WhatsApp user can make the service email
+        any third-party address with
+        their own text quoted in it. Even with a valid signature this needs
+        limits: don't quote the raw text
+        (or escape and truncate it), and rate-limit per wa_id.
+
+     B. Meta webhook behaviour
+
+     6. Verification handshake is wrong (server.js:11). Meta expects the
+        hub.challenge value echoed back as
+        plain text. Returning 'OK' means the webhook can never be verified in
+        the Meta dashboard.
+     7. The 200 is sent only after all the work is done. The handler awaits
+        Resend plus the Graph API before replying.
+        Meta expects a fast 200 and retries slow or failed deliveries, so slow
+        upstreams turn into duplicate
+        deliveries.
+     8. Returning 500 after the email was already sent causes a duplicate
+        (server.js:25-27). Example: the email
+        succeeds, then sendWhatsAppText throws (network error, or bad token →
+        fetch rejects). The route returns 500,
+        Meta retries the same message, and the email goes out again. This is the
+        main duplicate path.
+     9. No idempotency. Meta delivers webhooks at least once, and the same
+        messages[].id (wamid) can arrive more
+        than once. Nothing records which wamids were handled. Two concurrent
+        deliveries also race
+        (check-then-act), so the claim must be atomic.
+     10. Only the first item is processed (server.js:19-20).
+         entry[0].changes[0].messages[0] only. Meta can
+         batch several entries, changes or messages in one POST, and the rest
+         are silently dropped.
+     11. No payload sanity checks. object === 'whatsapp_business_account', field
+         === 'messages' and
+         metadata.phone_number_id === WHATSAPP_PHONE_NUMBER_ID are never
+         checked. Non-text types (image, audio,
+         reaction, button) are treated as "no email" and trigger a reply anyway.
+     12. sendWhatsAppText ignores failures and has no timeout (whatsapp.js).
+         res.ok is never checked, so
+         401/400 errors are swallowed as "success", and a hung fetch stalls the
+         webhook response (see #7). The Graph
+         version v21.0 is hard-coded. Make it configurable and confirm it is
+         still supported as of Nov 2026.
+
+     C. Resend behaviour
+
+     13. Resend errors are treated as success (handler.js:17). resend 4.8
+         emails.send() does not throw. It
+         returns { data, error } (confirmed in
+         node_modules/resend/dist/index.js:561-583). A failed send is
+         ignored and the client is still told "A confirmation email has been
+         sent".
+     14. onboarding@resend.dev cannot email real clients. Resend's test sender
+         only delivers to the
+         account owner's own address, so every real client email is rejected
+         (and with #13, silently). A verified
+         sending domain is needed, set through a RESEND_FROM env var.
+     15. No Resend idempotency key. resend 4.8 supports emails.send(payload, {
+         idempotencyKey })
+         (dist/index.js:598). Passing the wamid gives a second, server-side
+         guard against duplicates (24 h window).
+     16. Email extraction is fragile (handler.js:5). "My email is a@b.com."
+         captures a@b.com. with the
+         trailing dot, which Resend rejects. There is no lowercase or trim
+         normalization either.
+
+     D. Render / runtime
+
+     17. Hard-coded port 3000 (server.js:33). Render assigns PORT. Without
+         process.env.PORT the deploy
+         fails its port check.
+     18. .env is never loaded. There is no dotenv and no --env-file. Locally
+         every variable is undefined, and
+         new Resend(undefined) throws "Missing API key" at require time
+         (dist/index.js:538-546), so
+         npm start crashes immediately. It also means the "sign with the .env
+         secret" test can't work as is.
+     19. No engines.node. The code relies on global fetch (Node ≥18). Pin it so
+         Render doesn't pick an old runtime.
+     20. package-lock.json is untracked. Render builds won't be reproducible.
+         Commit it.
+     21. No env validation at startup. Missing secrets should fail fast with a
+         clear message, not at the
+         first webhook.
+     22. In-memory dedupe would not survive Render. Deploys, restarts, free-tier
+         spin-down and multiple instances
+         all wipe memory. Dedupe state has to be persistent (Render Postgres).
+         Free-tier cold starts (~30-60 s)
+         also exceed Meta's timeout and cause retries, so use a paid instance or
+         at least rely on the dedupe.
+     23. No graceful SIGTERM handling. Render sends SIGTERM on every deploy.
+         Once processing is async (#7),
+         in-flight work needs a recorded status so it isn't lost or redone.
+
+     E. Testing
+
+     24. No way to send a signed test. There is no script and no npm test. The
+         signature has to be computed over
+         the exact bytes sent, and re-serialising the JSON breaks it. The
+         sample's fake keys mean Resend and Graph calls will
+         fail, so a dry-run mode is needed to check the flow locally. Note the
+         sample timestamp (Nov 2025) is old,
+         so any staleness filter must not reject it in tests.
+
+     ---
+
+     Fix plan
+
+     Files: src/server.js, src/handler.js, src/whatsapp.js, new src/config.js,
+     src/signature.js,
+     src/store.js, scripts/send-sample.js, test/*.test.js, package.json,
+     .gitignore, README.md.
+
+     1. Repo hygiene: git rm --cached .env, add .env to .gitignore, add
+        .env.example, commit package-lock.json.
+     2. Config (src/config.js): require('dotenv').config() (no-op on Render),
+        validate required vars, expose
+        PORT (default 3000), RESEND_FROM, GRAPH_API_VERSION, EMAIL_DRY_RUN,
+        DATABASE_URL.
+        Build the Resend client lazily from config.
+     3. Signature (src/signature.js): express.json({ verify: (req,_res,buf) =>
+        req.rawBody = buf }).
+        Compute sha256= + HMAC hex and compare with crypto.timingSafeEqual
+        (equal lengths checked first). Return 401 on mismatch.
+     4. GET /webhook: compare against a defined token only and echo
+        hub.challenge as text/plain.
+     5. POST /webhook: verify signature, then return 200 immediately, then
+        process every
+        entry[] → changes[] → messages[] asynchronously. Check object, field and
+        phone_number_id, and handle only type === 'text'.
+     6. Idempotency (src/store.js): a processed_messages(wamid PK, status,
+        created_at) table in Render Postgres
+        (pg). Atomic claim with INSERT … ON CONFLICT DO NOTHING RETURNING. Skip
+        if not claimed. Mark email_sent /
+        failed. When DATABASE_URL is unset (local only), fall back to an
+        in-memory map and log a warning.
+        Also pass idempotencyKey: wamid to Resend.
+     7. Handler: escape HTML (name and text, truncated), strip trailing
+        punctuation and lowercase the email, check
+        { error } from Resend and only claim success when data.id exists. A
+        WhatsApp reply failure is logged and
+        never triggers a re-send. In EMAIL_DRY_RUN=true mode, log the payload
+        instead of calling Resend or Graph.
+     8. whatsapp.js: AbortSignal.timeout(10000), check res.ok, configurable
+        Graph version.
+     9. Runtime: app.listen(config.PORT), engines: { node: ">=20" }, SIGTERM →
+        server.close() and close the pool.
+     10. Render: start command npm start, health check /health, env vars set in
+         the dashboard, Postgres attached.
+
+     Verification
+
+     - scripts/send-sample.js reads samples/incoming-message.json as raw bytes,
+       signs them with
+       META_APP_SECRET from .env, and POSTs to http://localhost:$PORT/webhook
+       with X-Hub-Signature-256.
+     - Run locally with EMAIL_DRY_RUN=true npm start, then:
+       - signed sample → 200, log shows one email to fatima@example.com with
+         escaped HTML;
+       - same sample sent twice (and twice concurrently) → second one logged as
+         duplicate, no second email;
+       - tampered body or missing header → 401;
+       - GET
+         /webhook?hub.mode=subscribe&hub.verify_token=<token>&hub.challenge=123
+         → 123; wrong or missing token → 403.
+     - npm test (node:test + supertest) covers the signature, challenge, dedupe,
+       email extraction (trailing dot) and
+       Resend {error} handling with a stubbed client.
+     - On Render: /health OK, Meta dashboard "Verify and save" succeeds, a real
+       WhatsApp message produces one email.
+
+● Plan approved, so I'm implementing it now. First I'll unstage .env and add pg
+  for the durable dedupe store.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● .env is now out of the index (still on disk). Next, the source files.
+
+● Write(.gitignore)
+  ⎿  Added 3 lines
+      1  node_modules
+      2 +.env                                                            
+      3 +.env.*                                                          
+      4 +!.env.example                                                   
+
+● Write(.env.example)
+  ⎿  User rejected write to .env.example
+       1 # Copy to .env for local runs. On Render, set these in the dashb
+         oard instead (never commit real values).
+       2 META_VERIFY_TOKEN=choose-a-long-random-string
+       3 META_APP_SECRET=app-secret-from-meta-app-dashboard
+       4 META_ACCESS_TOKEN=permanent-system-user-token
+       5 WHATSAPP_PHONE_NUMBER_ID=000000000000000
+       6 GRAPH_API_VERSION=v24.0
+       7
+       8 RESEND_API_KEY=re_xxx
+       9 # Must be an address on a domain verified in Resend (onboarding@
+         resend.dev only delivers to your own account email)
+      10 RESEND_FROM=Top Delmon <no-reply@your-verified-domain.com>
+     … +9 lines
+
+● Write(src\config.js)
+  ⎿  User rejected write to src\config.js
+       1 const path = require('path');
+       2
+       3 // Load .env for local runs. Variables already set in the enviro
+         nment (e.g. by Render) are NOT overridden.
+       4 function loadDotEnv(file = path.join(__dirname, '..', '.env')) {
+       5   try {
+       6     process.loadEnvFile(file);
+       7   } catch (err) {
+       8     if (err.code !== 'ENOENT') throw err;
+       9   }
+      10 }
+     … +31 lines
+
+● Write(src\signature.js)
+  ⎿  User rejected write to src\signature.js
+       1 const crypto = require('crypto');
+       2
+       3 // Meta signs each webhook POST: X-Hub-Signature-256: sha256=<he
+         x HMAC-SHA256 of the raw body, keyed by the app secret>
+       4 function sign(appSecret, rawBody) {
+       5   return 'sha256=' + crypto.createHmac('sha256', appSecret).upda
+         te(rawBody).digest('hex');
+       6 }
+       7
+       8 function isValidSignature(appSecret, rawBody, header) {
+       9   if (typeof header !== 'string' || !Buffer.isBuffer(rawBody)) r
+         eturn false;
+      10   const expected = Buffer.from(sign(appSecret, rawBody));
+     … +6 lines
+
+● Write(src\store.js)
+  ⎿  User rejected write to src\store.js
+       1 // Records which WhatsApp message ids (wamid) have been handled,
+          so a message is processed at most once.
+       2 // claim() must be atomic: two concurrent deliveries of the same
+          wamid must not both get `true`.
+       3
+       4 class MemoryStore {
+       5   constructor() {
+       6     this.items = new Map();
+       7   }
+       8   async init() {}
+       9   async claim(wamid) {
+      10     if (this.items.has(wamid)) return false;
+     … +58 lines
+
+● Write(src\whatsapp.js)
+  ⎿  User rejected write to src\whatsapp.js
+      1 function createWhatsAppSender(config, log = console) {
+      2   if (config.dryRun) {
+      3     return async (to, body) => {
+      4       log.log(`[dry-run] WhatsApp -> ${to}: ${body}`);
+      5       return { dryRun: true };
+      6     };
+      7   }
+      8
+      9   const url = `https://graph.facebook.com/${config.graphApiVersio
+        n}/${config.phoneNumberId}/messages`;
+     … +21 lines
+  ⎿  Interrupted · What should Claude do instead?
+
+> continue
+
+● Continuing. I'll retry the files that weren't written.
+
+● Write(.env.example)
+  ⎿  Wrote 18 lines to .env.example
+       1 # Copy to .env for local runs. On Render, set these in the dashb
+         oard instead (never commit real values).
+       2 META_VERIFY_TOKEN=choose-a-long-random-string
+       3 META_APP_SECRET=app-secret-from-meta-app-dashboard
+       4 META_ACCESS_TOKEN=permanent-system-user-token
+       5 WHATSAPP_PHONE_NUMBER_ID=000000000000000
+       6 GRAPH_API_VERSION=v24.0
+       7
+       8 RESEND_API_KEY=re_xxx
+       9 # Must be an address on a domain verified in Resend (onboarding@
+     … +10 lines (ctrl+o to expand)
+
+● Write(src\config.js)
+  ⎿  Wrote 40 lines to src\config.js
+       1 const path = require('path');
+       2
+       3 // Load .env for local runs. Variables already set in the enviro
+         nment (e.g. by Render) are NOT overridden.
+       4 function loadDotEnv(file = path.join(__dirname, '..', '.env')) {
+       5   try {
+       6     process.loadEnvFile(file);
+       7   } catch (err) {
+       8     if (err.code !== 'ENOENT') throw err;
+       9   }
+     … +31 lines (ctrl+o to expand)
+
+● Write(src\signature.js)
+  ⎿  Wrote 15 lines to src\signature.js
+       1 const crypto = require('crypto');
+       2
+       3 // Meta signs each webhook POST: X-Hub-Signature-256: sha256=<he
+         x HMAC-SHA256 of the raw body, keyed by the app secret>
+       4 function sign(appSecret, rawBody) {
+       5   return 'sha256=' + crypto.createHmac('sha256', appSecret).upda
+         te(rawBody).digest('hex');
+       6 }
+       7
+       8 function isValidSignature(appSecret, rawBody, header) {
+     … +7 lines (ctrl+o to expand)
+
+● Write(src\store.js)
+  ⎿  Wrote 67 lines to src\store.js
+       1 // Records which WhatsApp message ids (wamid) have been handled,
+          so a message is processed at most once.
+       2 // claim() must be atomic: two concurrent deliveries of the same
+          wamid must not both get `true`.
+       3
+       4 class MemoryStore {
+       5   constructor() {
+       6     this.items = new Map();
+       7   }
+       8   async init() {}
+     … +59 lines (ctrl+o to expand)
+
+● Write(src\whatsapp.js)
+  ⎿  Added 28 lines, removed 12 lines
+       1 -async function sendWhatsAppText(to, body) {                    
+       2 -  const url = `https://graph.facebook.com/v21.0/${process.env.W
+         -HATSAPP_PHONE_NUMBER_ID}/messages`;                            
+       3 -  const res = await fetch(url, {                               
+       4 -    method: 'POST',                                            
+       5 -    headers: {                                                 
+       6 -      Authorization: `Bearer ${process.env.META_ACCESS_TOKEN}`,
+       7 -      'Content-Type': 'application/json',                      
+       8 -    },                                                         
+       9 -    body: JSON.stringify({ messaging_product: 'whatsapp', to, t
+         -ype: 'text', text: { body } }),                                
+      10 -  });                                                          
+      11 -  return res.json();                                           
+       1 +function createWhatsAppSender(config, log = console) {         
+       2 +  if (config.dryRun) {                                         
+       3 +    return async (to, body) => {                               
+       4 +      log.log(`[dry-run] WhatsApp -> ${to}: ${body}`);         
+       5 +      return { dryRun: true };                                 
+       6 +    };                                                         
+       7 +  }                                                            
+       8 +                                                               
+       9 +  const url = `https://graph.facebook.com/${config.graphApiVers
+         +ion}/${config.phoneNumberId}/messages`;                        
+      10 +                                                               
+      11 +  return async function sendWhatsAppText(to, body) {           
+      12 +    const res = await fetch(url, {                             
+      13 +      method: 'POST',                                          
+      14 +      headers: {                                               
+      15 +        Authorization: `Bearer ${config.accessToken}`,         
+      16 +        'Content-Type': 'application/json',                    
+      17 +      },                                                       
+      18 +      body: JSON.stringify({ messaging_product: 'whatsapp', to,
+         + type: 'text', text: { body } }),                              
+      19 +      signal: AbortSignal.timeout(10_000),                     
+      20 +    });                                                        
+      21 +    const data = await res.json().catch(() => null);           
+      22 +    if (!res.ok) {                                             
+      23 +      const msg = data?.error?.message || res.statusText;      
+      24 +      throw new Error(`WhatsApp send failed (${res.status}): ${
+         +msg}`);                                                        
+      25 +    }                                                          
+      26 +    return data;                                               
+      27 +  };                                                           
+      28  }
+      29  
+      14 -module.exports = { sendWhatsAppText };                         
+      30 +module.exports = { createWhatsAppSender };                     
+● Now the email sender, the message handler, and the server.
+
+● Write(src\email.js)
+  ⎿  Wrote 24 lines to src\email.js
+       1 const { Resend } = require('resend');
+       2
+       3 // Returns sendEmail(payload, { idempotencyKey }) -> { id }. Thr
+         ows on any Resend error.
+       4 function createEmailSender(config, log = console) {
+       5   if (config.dryRun) {
+       6     return async (payload, { idempotencyKey }) => {
+       7       log.log(`[dry-run] Email -> ${payload.to} | ${payload.subj
+         ect} | key=${idempotencyKey}\n${payload.html}`);
+       8       return { id: `dry-run:${idempotencyKey}` };
+     … +16 lines (ctrl+o to expand)
+
+● Write(src\handler.js)
+  ⎿  Added 112 lines, removed 19 lines
+        1 -const { Resend } = require('resend');                         
+        2 -const { sendWhatsAppText } = require('./whatsapp');           
+        1 +// Each segment after "@" must be followed by characters, so a
+          + sentence-ending "." is not captured.                         
+        2 +const EMAIL_REGEX = /[A-Z0-9._%+-]+@[A-Z0-9-]+(?:\.[A-Z0-9-]+)
+          ++/i;                                                          
+        3 +const MAX_QUOTED_TEXT = 1000;                                 
+        4  
+        4 -const resend = new Resend(process.env.RESEND_API_KEY);        
+        5 -const EMAIL_REGEX = /[\w.+-]+@[\w-]+\.[\w.]+/;                
+        5 +function extractEmail(text) {                                 
+        6 +  const match = String(text || '').match(EMAIL_REGEX);        
+        7 +  return match ? match[0].toLowerCase() : null;               
+        8 +}                                                             
+        9  
+        7 -async function handleIncomingMessage(message, contact) {      
+        8 -  const text = message.text?.body || '';                      
+        9 -  const name = contact?.profile?.name || 'Client';            
+       10 -  const email = (text.match(EMAIL_REGEX) || [])[0];           
+       10 +function escapeHtml(value) {                                  
+       11 +  return String(value)                                        
+       12 +    .replace(/&/g, '&amp;')                                   
+       13 +    .replace(/</g, '&lt;')                                    
+       14 +    .replace(/>/g, '&gt;')                                    
+       15 +    .replace(/"/g, '&quot;')                                  
+       16 +    .replace(/'/g, '&#39;');                                  
+       17 +}                                                             
+       18  
+       12 -  if (!email) {                                               
+       13 -    await sendWhatsAppText(message.from, 'Please send your ema
+          -il address so we can confirm your request.');                 
+       14 -    return;                                                   
+       15 -  }                                                           
+       19 +function truncate(text, max) {                                
+       20 +  return text.length > max ? text.slice(0, max) + '…' : text; 
+       21 +}                                                             
+       22  
+       17 -  await resend.emails.send({                                  
+       18 -    from: 'Top Delmon <onboarding@resend.dev>',               
+       19 -    to: email,                                                
+       23 +function buildConfirmationEmail({ from, to, name, text }) {   
+       24 +  const quoted = truncate(text, MAX_QUOTED_TEXT);             
+       25 +  return {                                                    
+       26 +    from,                                                     
+       27 +    to,                                                       
+       28      subject: 'We received your request',
+       21 -    html: `<p>Dear ${name},</p><p>We received your message: "$
+          -{text}". Our team will contact you within one working day.</p>
+          -`,                                                            
+       22 -  });                                                         
+       29 +    html:                                                     
+       30 +      `<p>Dear ${escapeHtml(name)},</p>` +                    
+       31 +      `<p>We received your message: "${escapeHtml(quoted)}".</
+          +p>` +                                                         
+       32 +      '<p>Our team will contact you within one working day.</p
+          +>',                                                           
+       33 +    text: `Dear ${name},\n\nWe received your message: "${quote
+          +d}".\n\nOur team will contact you within one working day.`,   
+       34 +  };                                                          
+       35 +}                                                             
+       36  
+       24 -  await sendWhatsAppText(message.from, 'Thank you. A confirmat
+          -ion email has been sent.');                                   
+       37 +function createProcessor({ config, store, sendEmail, sendWhats
+          +App, log = console }) {                                       
+       38 +  // Pull every text message addressed to our number out of a 
+          +webhook payload.                                              
+       39 +  // Meta may batch several entries / changes / messages in on
+          +e POST.                                                       
+       40 +  function extractMessages(payload) {                         
+       41 +    if (payload?.object !== 'whatsapp_business_account') retur
+          +n [];                                                         
+       42 +    const items = [];                                         
+       43 +    for (const entry of payload.entry || []) {                
+       44 +      for (const change of entry.changes || []) {             
+       45 +        if (change.field !== 'messages') continue;            
+       46 +        const value = change.value || {};                     
+       47 +        if (value.metadata?.phone_number_id !== config.phoneNu
+          +mberId) {                                                     
+       48 +          log.warn(`[webhook] ignoring change for phone_number
+          +_id ${value.metadata?.phone_number_id}`);                     
+       49 +          continue;                                           
+       50 +        }                                                     
+       51 +        // value.statuses (sent/delivered/read receipts) are i
+          +ntentionally ignored.                                         
+       52 +        for (const message of value.messages || []) {         
+       53 +          if (!message?.id || !message.from) continue;        
+       54 +          if (message.type !== 'text') {                      
+       55 +            log.log(`[webhook] ignoring non-text message ${mes
+          +sage.id} (type=${message.type})`);                            
+       56 +            continue;                                         
+       57 +          }                                                   
+       58 +          const contact = (value.contacts || []).find((c) => c
+          +.wa_id === message.from) || value.contacts?.[0];              
+       59 +          items.push({ message, contact });                   
+       60 +        }                                                     
+       61 +      }                                                       
+       62 +    }                                                         
+       63 +    return items;                                             
+       64 +  }                                                           
+       65 +                                                              
+       66 +  async function mark(wamid, status, detail) {                
+       67 +    try {                                                     
+       68 +      await store.mark(wamid, status, detail);                
+       69 +    } catch (err) {                                           
+       70 +      log.error(`[store] failed to mark ${wamid} as ${status}:
+          + ${err.message}`);                                            
+       71 +    }                                                         
+       72 +  }                                                           
+       73 +                                                              
+       74 +  // A failed WhatsApp reply is logged only. It must never cau
+          +se the email to be sent again.                                
+       75 +  async function reply(to, body, wamid) {                     
+       76 +    try {                                                     
+       77 +      await sendWhatsApp(to, body);                           
+       78 +    } catch (err) {                                           
+       79 +      log.error(`[whatsapp] reply for ${wamid} failed: ${err.m
+          +essage}`);                                                    
+       80 +    }                                                         
+       81 +  }                                                           
+       82 +                                                              
+       83 +  // Must only be called for a message that was successfully c
+          +laimed in the store.                                          
+       84 +  async function processMessage({ message, contact }) {       
+       85 +    const wamid = message.id;                                 
+       86 +    const text = message.text?.body || '';                    
+       87 +    const name = contact?.profile?.name || 'Client';          
+       88 +    const email = extractEmail(text);                         
+       89 +                                                              
+       90 +    if (!email) {                                             
+       91 +      await mark(wamid, 'no_email');                          
+       92 +      await reply(message.from, 'Please send your email addres
+          +s so we can confirm your request.', wamid);                   
+       93 +      return;                                                 
+       94 +    }                                                         
+       95 +                                                              
+       96 +    let sent;                                                 
+       97 +    try {                                                     
+       98 +      sent = await sendEmail(buildConfirmationEmail({ from: co
+          +nfig.resendFrom, to: email, name, text }), {                  
+       99 +        idempotencyKey: `wa-confirm/${wamid}`,                
+      100 +      });                                                     
+      101 +    } catch (err) {                                           
+      102 +      log.error(`[email] ${wamid} failed: ${err.message}`);   
+      103 +      await mark(wamid, 'email_failed', err.message);         
+      104 +      await reply(                                            
+      105 +        message.from,                                         
+      106 +        `Sorry, we could not send a confirmation email to ${em
+          +ail}. Please check the address and send it again.`,           
+      107 +        wamid,                                                
+      108 +      );                                                      
+      109 +      return;                                                 
+      110 +    }                                                         
+      111 +                                                              
+      112 +    await mark(wamid, 'email_sent', sent.id);                 
+      113 +    log.log(`[email] ${wamid} sent (${sent.id})`);            
+      114 +    await reply(message.from, `Thank you. A confirmation email
+          + has been sent to ${email}.`, wamid);                         
+      115 +  }                                                           
+      116 +                                                              
+      117 +  return { extractMessages, processMessage };                 
+      118  }
+      119  
+       27 -module.exports = { handleIncomingMessage };                   
+      120 +module.exports = { createProcessor, extractEmail, escapeHtml, 
+          +buildConfirmationEmail };                                     
+
+● Write(src\server.js)
+  ⎿  Added 121 lines, removed 26 lines
+        1 +const crypto = require('crypto');                             
+        2  const express = require('express');
+        2 -const { handleIncomingMessage } = require('./handler');       
+        3 +const { loadDotEnv, loadConfig } = require('./config');       
+        4 +const { isValidSignature } = require('./signature');          
+        5 +const { createStore } = require('./store');                   
+        6 +const { createProcessor } = require('./handler');             
+        7 +const { createEmailSender } = require('./email');             
+        8 +const { createWhatsAppSender } = require('./whatsapp');       
+        9  
+        4 -const app = express();                                        
+        5 -app.use(express.json());                                      
+       10 +function safeEqual(a, b) {                                    
+       11 +  const x = Buffer.from(String(a));                           
+       12 +  const y = Buffer.from(String(b));                           
+       13 +  return x.length === y.length && crypto.timingSafeEqual(x, y)
+          +;                                                             
+       14 +}                                                             
+       15  
+        7 -// Meta webhook verification                                  
+        8 -app.get('/webhook', (req, res) => {                           
+        9 -  if (req.query['hub.mode'] === 'subscribe' &&                
+       10 -      req.query['hub.verify_token'] === process.env.META_VERIF
+          -Y_TOKEN) {                                                    
+       11 -    return res.status(200).send('OK');                        
+       12 -  }                                                           
+       13 -  return res.sendStatus(403);                                 
+       14 -});                                                           
+       16 +function createApp({ config, store, processor, log = console }
+          +) {                                                           
+       17 +  const app = express();                                      
+       18 +  app.disable('x-powered-by');                                
+       19  
+       16 -// Incoming WhatsApp messages                                 
+       17 -app.post('/webhook', async (req, res) => {                    
+       18 -  try {                                                       
+       19 -    const entry = req.body.entry?.[0]?.changes?.[0]?.value;   
+       20 -    const message = entry?.messages?.[0];                     
+       21 -    if (message) {                                            
+       22 -      await handleIncomingMessage(message, entry.contacts?.[0]
+          -);                                                            
+       20 +  // Background work started after Meta has been answered; awa
+          +ited on shutdown and in tests.                                
+       21 +  const inflight = new Set();                                 
+       22 +  const track = (promise) => {                                
+       23 +    const p = promise.catch((err) => log.error('[webhook] proc
+          +essing error:', err));                                        
+       24 +    inflight.add(p);                                          
+       25 +    p.finally(() => inflight.delete(p));                      
+       26 +  };                                                          
+       27 +  app.locals.drain = () => Promise.allSettled([...inflight]); 
+       28 +                                                              
+       29 +  // Meta webhook verification: echo hub.challenge when the ve
+          +rify token matches.                                           
+       30 +  app.get('/webhook', (req, res) => {                         
+       31 +    const mode = req.query['hub.mode'];                       
+       32 +    const token = req.query['hub.verify_token'];              
+       33 +    const challenge = req.query['hub.challenge'];             
+       34 +    if (                                                      
+       35 +      mode === 'subscribe' &&                                 
+       36 +      typeof token === 'string' &&                            
+       37 +      typeof challenge === 'string' &&                        
+       38 +      safeEqual(token, config.verifyToken)                    
+       39 +    ) {                                                       
+       40 +      return res.status(200).set('X-Content-Type-Options', 'no
+          +sniff').type('text/plain').send(challenge);                   
+       41      }
+       24 -    res.sendStatus(200);                                      
+       25 -  } catch (err) {                                             
+       26 -    console.error(err);                                       
+       27 -    res.sendStatus(500);                                      
+       28 -  }                                                           
+       29 -});                                                           
+       42 +    return res.sendStatus(403);                               
+       43 +  });                                                         
+       44  
+       31 -app.get('/health', (req, res) => res.json({ ok: true }));     
+       45 +  // Incoming WhatsApp events. Keep the raw bytes: the signatu
+          +re is computed over them.                                     
+       46 +  app.post('/webhook', express.raw({ type: '*/*', limit: '1mb'
+          + }), async (req, res) => {                                    
+       47 +    if (!isValidSignature(config.appSecret, req.body, req.get(
+          +'x-hub-signature-256'))) {                                    
+       48 +      return res.sendStatus(401);                             
+       49 +    }                                                         
+       50  
+       33 -app.listen(3000, () => console.log('Listening on 3000'));     
+       51 +    let payload;                                              
+       52 +    try {                                                     
+       53 +      payload = JSON.parse(req.body.toString('utf8'));        
+       54 +    } catch {                                                 
+       55 +      return res.sendStatus(400);                             
+       56 +    }                                                         
+       57 +                                                              
+       58 +    // Claim each message id atomically BEFORE answering Meta.
+          + A claimed id is never processed again,                       
+       59 +    // so Meta retries can't produce a second email.          
+       60 +    let claimError = null;                                    
+       61 +    for (const item of processor.extractMessages(payload)) {  
+       62 +      let claimed;                                            
+       63 +      try {                                                   
+       64 +        claimed = await store.claim(item.message.id);         
+       65 +      } catch (err) {                                         
+       66 +        claimError = err;                                     
+       67 +        break;                                                
+       68 +      }                                                       
+       69 +      if (claimed) track(processor.processMessage(item));     
+       70 +      else log.log(`[webhook] duplicate delivery of ${item.mes
+          +sage.id} ignored`);                                           
+       71 +    }                                                         
+       72 +                                                              
+       73 +    if (claimError) {                                         
+       74 +      // Dedupe store unavailable: ask Meta to retry later. Al
+          +ready-claimed messages are skipped on retry.                  
+       75 +      log.error('[store] claim failed:', claimError.message); 
+       76 +      return res.sendStatus(500);                             
+       77 +    }                                                         
+       78 +    // Answer quickly. Email and WhatsApp work continues in th
+          +e background.                                                 
+       79 +    return res.sendStatus(200);                               
+       80 +  });                                                         
+       81 +                                                              
+       82 +  app.get('/health', (req, res) => res.json({ ok: true }));   
+       83 +                                                              
+       84 +  return app;                                                 
+       85 +}                                                             
+       86 +                                                              
+       87 +async function main() {                                       
+       88 +  loadDotEnv();                                               
+       89 +  const env = { ...process.env };                             
+       90 +  if (process.argv.includes('--dry-run')) env.DRY_RUN = 'true'
+          +;                                                             
+       91 +  const config = loadConfig(env);                             
+       92 +                                                              
+       93 +  const store = createStore(config);                          
+       94 +  await store.init();                                         
+       95 +  const processor = createProcessor({                         
+       96 +    config,                                                   
+       97 +    store,                                                    
+       98 +    sendEmail: createEmailSender(config),                     
+       99 +    sendWhatsApp: createWhatsAppSender(config),               
+      100 +  });                                                         
+      101 +  const app = createApp({ config, store, processor });        
+      102 +                                                              
+      103 +  const server = app.listen(config.port, () => {              
+      104 +    console.log(`Listening on ${config.port}${config.dryRun ? 
+          +' (DRY RUN: no emails or WhatsApp messages are sent)' : ''}`);
+      105 +  });                                                         
+      106 +                                                              
+      107 +  let stopping = false;                                       
+      108 +  const shutdown = async (signal) => {                        
+      109 +    if (stopping) return;                                     
+      110 +    stopping = true;                                          
+      111 +    console.log(`${signal} received, finishing in-flight work.
+          +..`);                                                         
+      112 +    server.close();                                           
+      113 +    await app.locals.drain();                                 
+      114 +    await store.close();                                      
+      115 +    process.exit(0);                                          
+      116 +  };                                                          
+      117 +  process.on('SIGTERM', () => shutdown('SIGTERM'));           
+      118 +  process.on('SIGINT', () => shutdown('SIGINT'));             
+      119 +}                                                             
+      120 +                                                              
+      121 +if (require.main === module) {                                
+      122 +  main().catch((err) => {                                     
+      123 +    console.error(`Startup failed: ${err.message}`);          
+      124 +    process.exit(1);                                          
+      125 +  });                                                         
+      126 +}                                                             
+      127 +                                                              
+      128 +module.exports = { createApp };                               
+
+● Now the signed-sample script and the tests.
+
+● Write(scripts\send-sample.js)
+  ⎿  Wrote 48 lines to scripts\send-sample.js
+       1 // Sends a sample webhook to the local server, signed with META_
+         APP_SECRET from .env, exactly as Meta would.
+       2 //
+       3 //   node scripts/send-sample.js                         # sends
+          samples/incoming-message.json once
+       4 //   node scripts/send-sample.js --times=3               # same
+         message 3 times concurrently (dedupe test)
+       5 //   node scripts/send-sample.js --tamper                # body
+         changed after signing -> expect 401
+       6 //   node scripts/send-sample.js path/to/payload.json
+     … +42 lines (ctrl+o to expand)
+
+● Write(test\webhook.test.js)
+  ⎿  Wrote 168 lines to test\webhook.test.js
+      1 const { test, beforeEach, afterEach } = require('node:test');
+      2 const assert = require('node:assert/strict');
+      3 const fs = require('fs');
+      4 const path = require('path');
+      5 const { createApp } = require('../src/server');
+      6 const { createProcessor, extractEmail } = require('../src/handler
+        ');
+      7 const { MemoryStore } = require('../src/store');
+      8 const { sign } = require('../src/signature');
+      9 const { loadConfig } = require('../src/config');
+     … +159 lines (ctrl+o to expand)
+
+  Read 1 file (ctrl+o to expand)
+
+● Write(package.json)
+  ⎿  Added 9 lines, removed 3 lines
+       3    "version": "1.0.0",
+       4    "description": "Receives client WhatsApp messages and sends a
+           confirmation email",
+       5    "main": "src/server.js",
+       6 +  "engines": {                                                 
+       7 +    "node": ">=20.12"                                          
+       8 +  },                                                           
+       9    "scripts": {
+       7 -    "start": "node src/server.js"                              
+      10 +    "start": "node src/server.js",                             
+      11 +    "dev": "node src/server.js --dry-run",                     
+      12 +    "send-sample": "node scripts/send-sample.js",              
+      13 +    "test": "node --test"                                      
+      14    },
+      15    "dependencies": {
+      10 -    "express": "^4.19.2",                                      
+      16 +    "express": "^4.22.3",                                      
+      17      "pg": "^8.23.1",
+      12 -    "resend": "^4.0.0"                                         
+      18 +    "resend": "^4.8.0"                                         
+      19    }
+      20  }
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All 10 tests pass. Now the real end-to-end run: start the server locally in
+  dry-run mode and send the sample signed with the .env secret.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● End to end, it works with the real .env secret. Quick check that a normal
+  (non-dry-run) start fails fast with the current .env:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Now the README and a Render blueprint.
+
+● Write(README.md)
+  ⎿  Added 39 lines, removed 6 lines
+       1 -# td-whatsapp-intake (starter)                                 
+       1 +# td-whatsapp-intake                                           
+       2  
+       3 -A small service that receives client WhatsApp messages through 
+         -the Meta Cloud API webhook                                     
+       4 -and sends the client a confirmation email through Resend.      
+       3 +Receives client WhatsApp messages through the Meta Cloud API we
+         +bhook and sends the client a confirmation                      
+       4 +email through Resend.                                          
+       5  
+       6 -Run locally:                                                   
+       6 +## How it behaves                                              
+       7  
+       8 +- `GET /webhook` performs Meta's verification handshake (echoes
+         + `hub.challenge` when `hub.verify_token` matches).             
+       9 +- `POST /webhook` rejects any request whose `X-Hub-Signature-25
+         +6` is not a valid HMAC of the raw body with                    
+      10 +  `META_APP_SECRET` (401). Valid requests are answered with 200
+         + immediately and processed in the background.                  
+      11 +- Every text message id (`wamid`) is **claimed atomically** in 
+         +Postgres before Meta gets its 200. A claimed                   
+      12 +  message is never processed again, so Meta's retries and dupli
+         +cate deliveries can't send a second email. The                 
+      13 +  wamid is also sent to Resend as the `Idempotency-Key`. If the
+         + database is unreachable the endpoint returns                  
+      14 +  500 so Meta retries later.                                   
+      15 +- A failed WhatsApp reply is logged and never triggers a resend
+         + of the email. A Resend error is never reported to             
+      16 +  the client as success.                                       
+      17 +                                                               
+      18 +## Run locally                                                 
+      19 +                                                               
+      20      npm install
+       9 -    npm start                                                  
+      21 +    cp .env.example .env      # fill in values                 
+      22 +    npm run dev               # DRY RUN: logs emails / WhatsApp
+         + replies instead of sending them                               
+      23 +    npm run send-sample       # in a second terminal: POSTs sam
+         +ples/incoming-message.json signed with META_APP_SECRET         
+      24  
+      11 -This starter has NOT been reviewed. Treat it as code written by
+         - someone else that you now own.                                
+      25 +Useful variations:                                             
+      26 +                                                               
+      27 +    node scripts/send-sample.js --times=3    # same message 3x 
+         +concurrently -> exactly one email                              
+      28 +    node scripts/send-sample.js --tamper     # body altered aft
+         +er signing -> 401                                              
+      29 +    npm test                                 # automated tests 
+         +(no network, no database)                                      
+      30 +                                                               
+      31 +Without `DATABASE_URL` the service uses an in-memory dedupe sto
+         +re, which is fine locally but is lost on restart.              
+      32 +                                                               
+      33 +## Deploy on Render                                            
+      34 +                                                               
+      35 +1. Create a Postgres database and a Web Service (or use `render
+         +.yaml`).                                                       
+      36 +2. Build command `npm ci`, start command `npm start`, health ch
+         +eck path `/health`.                                            
+      37 +3. Set the environment variables from `.env.example` in the das
+         +hboard. `DATABASE_URL` = the database's                        
+      38 +   *Internal* URL. The service refuses to start on Render witho
+         +ut it.                                                         
+      39 +4. `RESEND_FROM` must use a domain verified in Resend (`onboard
+         +ing@resend.dev` only delivers to your own account).            
+      40 +5. Use an instance type that doesn't spin down. Free-tier cold 
+         +starts exceed Meta's webhook timeout.                          
+      41 +6. In the Meta app dashboard set the callback URL to `https://<
+         +service>.onrender.com/webhook` with the same verify            
+      42 +   token, and subscribe to the `messages` field.               
+      43 +                                                               
+      44 +Never commit `.env`. If real secrets were ever committed or sha
+         +red, rotate them.                                              
+
+● Write(render.yaml)
+  ⎿  Wrote 31 lines to render.yaml
+       1 databases:
+       2   - name: td-whatsapp-intake-db
+       3     plan: basic-256mb
+       4
+       5 services:
+       6   - type: web
+       7     name: td-whatsapp-intake
+       8     runtime: node
+       9     plan: starter
+      10     buildCommand: npm ci
+     … +21 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I found 24 problems and fixed all but one. The project now has 10 automated
+  tests, all passing, and I ran the service locally in dry-run mode (nothing is
+  actually sent) with the sample signed using your .env secret.
+
+  The problems
+
+  Security
+
+  1. .env was staged for commit. .gitignore only listed node_modules, so the
+     first push would have put every secret in git history permanently.
+  2. Meta's signature was never checked. META_APP_SECRET was loaded but never
+     used. Anyone with the URL could make the service email any address with
+     text they chose, under the "Top Delmon" name. The check also needs the raw
+     request bytes, and express.json() discards them.
+  3. HTML injection in the email. The WhatsApp profile name and the message text
+     went into the email HTML unescaped, so a client could inject links or fake
+     content into mail sent from your domain.
+  4. Verify-token bypass. If META_VERIFY_TOKEN was unset, a request with no
+     token passed, because undefined === undefined.
+  5. Open email relay. Any WhatsApp user can make the service email any address
+     with their text quoted in it.
+
+  Meta
+
+  6. The webhook could never be verified. It returned "OK" instead of echoing
+     back hub.challenge, which Meta requires.
+  7. Meta was answered only after all the work was done (Resend plus the
+     WhatsApp reply). Slow answers make Meta retry.
+  8. This was the main source of duplicate emails. If the email was sent but the
+     WhatsApp reply then failed, the service returned 500, Meta retried, and
+     the email went out again.
+  9. No record of handled messages. Meta can deliver the same message more than
+     once, and nothing tracked message ids. Two simultaneous deliveries could
+     both send.
+  10. Only the first message was handled. Meta can bundle several messages in
+      one request, and the rest were silently dropped.
+  11. No payload checks. The phone number id and event type were never verified,
+      and image or audio messages triggered the "send your email" reply.
+  12. WhatsApp errors were treated as success. The code never checked whether
+      the send worked and had no timeout. The API version v21.0 was hard-coded.
+
+  Resend
+
+  13. Failed emails looked successful. resend.emails.send() doesn't throw on
+      errors; it returns { data, error }. The client was told "email sent" even
+      when it failed.
+  14. onboarding@resend.dev can't email real clients. Resend's test sender only
+      delivers to your own account address.
+  15. No Resend idempotency key, which would be a second guard against
+      duplicates.
+  16. Sentence-ending dots broke addresses. "...fatima@example.com." captured
+      the trailing dot, giving an address Resend rejects.
+
+  Render and running locally
+
+  17. Port 3000 was hard-coded. Render assigns the port through PORT.
+  18. .env was never loaded. npm start crashed immediately with Resend's
+      "Missing API key", so the signed-sample test couldn't run at all.
+  19. No Node version pinned, though the code needs Node 18+ for fetch.
+  20. package-lock.json was untracked, so Render builds aren't reproducible.
+  21. No startup check for missing settings.
+  22. Remembering handled messages in memory doesn't survive Render. Deploys,
+      restarts and free-tier sleep all wipe it. Free-tier cold starts are also
+      slower than Meta's timeout, which causes retries.
+  23. No graceful shutdown. Render stops the service on every deploy, and
+      in-progress work would be lost.
+  24. No way to send a signed test message.
+
+  What changed
+
+  - Duplicates: each message id is recorded in Postgres in a single step before
+    Meta gets its 200. A recorded id is never processed again, and the id also
+    goes to Resend as an idempotency key. If the database is down, the service
+    returns 500 so Meta retries later. A failed WhatsApp reply is logged and
+    never re-sends the email.
+  - Security: the signature is checked on the raw bytes, and the name and text
+    are escaped and truncated in the email. .env is ignored, and there's a new
+    .env.example.
+  - Meta and Resend: hub.challenge is echoed, every message in a request is
+    handled, Resend errors are checked, and the sender comes from a RESEND_FROM
+    setting.
+  - Running it: .env loads locally and missing settings stop startup with a
+    clear message (on Render, a missing DATABASE_URL too). It uses PORT, shuts
+    down cleanly, and has a render.yaml and an updated README.
+  - Testing: npm run dev starts it in dry-run mode, and npm run send-sample
+    sends the signed sample (--times=3 sends it three times at once; --tamper
+    alters it).
+
+  What the local run showed
+
+  - With the token from .env, verification echoed the challenge; a wrong token
+    got 403.
+  - The signed sample got 200 and produced one email to fatima@example.com.
+  - Three more deliveries of the same message, sent at the same time, were each
+    logged as a duplicate. No second email.
+  - A tampered body got 401.
+  - A normal start with your current .env stops with Missing required
+    environment variables: RESEND_FROM.
+
+  Still open
+
+  - Postgres is untested here. The Postgres code ran against no real database;
+    the tests and local run use the in-memory fallback. Check it once on Render
+    with a database attached.
+  - API version: I set the default to v24.0 because v21.0 has probably expired
+    by now. Confirm it's still supported; it can be changed with
+    GRAPH_API_VERSION.
+  - Not fixed: #5 has no rate limit per sender. The same client sending the same
+    address in two separate messages also gets two emails. Say if either should
+    be blocked.
+  - Git: .env is out of the index but still on disk. package-lock.json and the
+    new files are not staged, and I haven't committed anything. If those secrets
+    were ever real, change them.
+
+> <ide_opened_file>The user opened the file c:\Users\Halby\Downloads\تافلم
+   starter\.env in the IDE. This may or may not be\نيحشرملل لسرت - رابتخالا
+  related to the current task.</ide_opened_file>
+
+> The values in .env other than META_APP_SECRET and META_VERIFY_TOKEN are
+  placeholders, and the graders will run npm start with only that file and send
+  messages signed with META_APP_SECRET. Make the service start and work with
+  only that file. Treat the fake Resend and Meta credentials as a normal
+  failure that is logged, not a crash. Add a timeout to the Resend call. Then
+  add a test that runs a small fake Resend server using RESEND_BASE_URL and
+  proves that the signed sample delivered several times, including at the same
+  time, results in exactly one email request.
+
+● First I'll check how the Resend SDK makes its HTTP call (base URL and whether
+  it accepts a timeout or abort signal).
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● I'm loading the Resend SDK only after .env is read and wrapping its call in a
+  timeout, since the SDK fixes RESEND_BASE_URL at load time and can't cancel
+  requests. Next I'll update the config so only the two real secrets are
+  required. · summary
+
+● Write(src\config.js)
+  ⎿  Added 31 lines, removed 14 lines
+       9    }
+      10  }
+      11  
+      12 -function loadConfig(env = process.env) {                       
+      12 +const DEFAULT_FROM = 'Top Delmon <onboarding@resend.dev>';     
+      13 +                                                               
+      14 +function loadConfig(env = process.env, log = console) {        
+      15    const dryRun = env.DRY_RUN === 'true';
+      16    const onRender = Boolean(env.RENDER);
+      17 +  const has = (k) => typeof env[k] === 'string' && env[k].trim(
+         +) !== '';                                                      
+      18  
+      16 -  const required = ['META_VERIFY_TOKEN', 'META_APP_SECRET', 'WH
+         -ATSAPP_PHONE_NUMBER_ID'];                                      
+      17 -  if (!dryRun) required.push('META_ACCESS_TOKEN', 'RESEND_API_K
+         -EY', 'RESEND_FROM');                                           
+      18 -  // In-memory dedupe is lost on every deploy/restart, so produ
+         -ction must use Postgres.                                       
+      19 -  if (onRender && !dryRun) required.push('DATABASE_URL');      
+      20 -                                                               
+      21 -  const missing = required.filter((k) => !env[k] || !env[k].tri
+         -m());                                                          
+      19 +  // Only the two values needed to talk to Meta securely are ma
+         +ndatory. Missing or fake delivery credentials                  
+      20 +  // (Resend / WhatsApp) don't stop the service; each send fail
+         +s and is logged instead.                                       
+      21 +  const required = ['META_VERIFY_TOKEN', 'META_APP_SECRET'];   
+      22 +  if (onRender && !dryRun) {                                   
+      23 +    // In production everything must be configured, and dedupe 
+         +must survive restarts (Postgres).                              
+      24 +    required.push('WHATSAPP_PHONE_NUMBER_ID', 'META_ACCESS_TOKE
+         +N', 'RESEND_API_KEY', 'RESEND_FROM', 'DATABASE_URL');          
+      25 +  }                                                            
+      26 +  const missing = required.filter((k) => !has(k));             
+      27    if (missing.length) {
+      28      throw new Error(`Missing required environment variables: ${
+          missing.join(', ')}`);
+      29    }
+      30  
+      31 +  if (!dryRun) {                                               
+      32 +    for (const k of ['WHATSAPP_PHONE_NUMBER_ID', 'META_ACCESS_T
+         +OKEN', 'RESEND_API_KEY']) {                                    
+      33 +      if (!has(k)) log.warn(`[config] ${k} is not set: the rela
+         +ted sends will fail and be logged.`);                          
+      34 +    }                                                          
+      35 +    if (!has('RESEND_FROM')) {                                 
+      36 +      log.warn(`[config] RESEND_FROM not set, using ${DEFAULT_F
+         +ROM} (Resend only delivers this to your own account).`);       
+      37 +    }                                                          
+      38 +  }                                                            
+      39 +                                                               
+      40    return {
+      27 -    port: Number(env.PORT) || 3000,                            
+      41 +    port: has('PORT') ? Number(env.PORT) : 3000,               
+      42      dryRun,
+      43      verifyToken: env.META_VERIFY_TOKEN,
+      44      appSecret: env.META_APP_SECRET,
+      31 -    accessToken: env.META_ACCESS_TOKEN,                        
+      32 -    phoneNumberId: env.WHATSAPP_PHONE_NUMBER_ID,               
+      33 -    graphApiVersion: env.GRAPH_API_VERSION || 'v24.0',         
+      34 -    resendApiKey: env.RESEND_API_KEY,                          
+      35 -    resendFrom: env.RESEND_FROM || 'Top Delmon <onboarding@rese
+         -nd.dev>',                                                      
+      36 -    databaseUrl: env.DATABASE_URL || null,                     
+      45 +    accessToken: has('META_ACCESS_TOKEN') ? env.META_ACCESS_TOK
+         +EN : null,                                                     
+      46 +    phoneNumberId: has('WHATSAPP_PHONE_NUMBER_ID') ? env.WHATSA
+         +PP_PHONE_NUMBER_ID : null,                                     
+      47 +    graphBaseUrl: (has('GRAPH_BASE_URL') ? env.GRAPH_BASE_URL :
+         + 'https://graph.facebook.com').replace(/\/+$/, ''),            
+      48 +    graphApiVersion: has('GRAPH_API_VERSION') ? env.GRAPH_API_V
+         +ERSION : 'v24.0',                                              
+      49 +    whatsappTimeoutMs: Number(env.WHATSAPP_TIMEOUT_MS) || 10_00
+         +0,                                                             
+      50 +    resendApiKey: has('RESEND_API_KEY') ? env.RESEND_API_KEY : 
+         +null,                                                          
+      51 +    resendFrom: has('RESEND_FROM') ? env.RESEND_FROM : DEFAULT_
+         +FROM,                                                          
+      52 +    resendTimeoutMs: Number(env.RESEND_TIMEOUT_MS) || 10_000,  
+      53 +    databaseUrl: has('DATABASE_URL') ? env.DATABASE_URL : null,
+      54    };
+      55  }
+      56  
+
+● Write(src\email.js)
+  ⎿  Added 31 lines, removed 4 lines
+       1 -const { Resend } = require('resend');                          
+       1 +class EmailTimeoutError extends Error {                        
+       2 +  constructor(ms) {                                            
+       3 +    super(`Resend did not respond within ${ms} ms`);           
+       4 +    this.name = 'EmailTimeoutError';                           
+       5 +    this.code = 'EMAIL_TIMEOUT';                               
+       6 +  }                                                            
+       7 +}                                                              
+       8  
+       3 -// Returns sendEmail(payload, { idempotencyKey }) -> { id }. Th
+         -rows on any Resend error.                                      
+       9 +function withTimeout(promise, ms) {                            
+      10 +  let timer;                                                   
+      11 +  const timeout = new Promise((_, reject) => {                 
+      12 +    timer = setTimeout(() => reject(new EmailTimeoutError(ms)),
+         + ms);                                                          
+      13 +  });                                                          
+      14 +  return Promise.race([promise, timeout]).finally(() => clearTi
+         +meout(timer));                                                 
+      15 +}                                                              
+      16 +                                                               
+      17 +// Returns sendEmail(payload, { idempotencyKey }) -> { id }. Th
+         +rows on any Resend error or timeout.                           
+      18  function createEmailSender(config, log = console) {
+      19    if (config.dryRun) {
+      20      return async (payload, { idempotencyKey }) => {
+     ...
+      23      };
+      24    }
+      25  
+      26 +  if (!config.resendApiKey) {                                  
+      27 +    return async () => {                                       
+      28 +      throw new Error('RESEND_API_KEY is not configured');     
+      29 +    };                                                         
+      30 +  }                                                            
+      31 +                                                               
+      32 +  // Required here (after .env is loaded), not at the top: the 
+         +SDK reads RESEND_BASE_URL once, when the module loads.         
+      33 +  const { Resend } = require('resend');                        
+      34    const resend = new Resend(config.resendApiKey);
+      35  
+      36    return async function sendEmail(payload, { idempotencyKey }) 
+          {
+      37 +    // The SDK accepts no AbortSignal, so the timeout is applie
+         +d around the call. On timeout the email may or may             
+      38 +    // not have been accepted; the caller treats that as "unkno
+         +wn" and does not retry.                                        
+      39      // resend.emails.send() does NOT throw on API errors; it re
+          solves to { data, error }.
+      16 -    const { data, error } = await resend.emails.send(payload, {
+         - idempotencyKey });                                            
+      40 +    const { data, error } = await withTimeout(                 
+      41 +      resend.emails.send(payload, { idempotencyKey }),         
+      42 +      config.resendTimeoutMs,                                  
+      43 +    );                                                         
+      44      if (error || !data?.id) {
+      45        throw new Error(`Resend error: ${error?.name || 'unknown'
+          }: ${error?.message || 'no email id returned'}`);
+      46      }
+     ...
+      48    };
+      49  }
+      50  
+      24 -module.exports = { createEmailSender };                        
+      51 +module.exports = { createEmailSender, EmailTimeoutError };     
+
+● Write(src\whatsapp.js)
+  ⎿  Added 8 lines, removed 2 lines
+       6      };
+       7    }
+       8  
+       9 -  const url = `https://graph.facebook.com/${config.graphApiVers
+         -ion}/${config.phoneNumberId}/messages`;                        
+       9 +  if (!config.accessToken || !config.phoneNumberId) {          
+      10 +    return async () => {                                       
+      11 +      throw new Error('META_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBE
+         +R_ID not configured');                                         
+      12 +    };                                                         
+      13 +  }                                                            
+      14  
+      15 +  const url = `${config.graphBaseUrl}/${config.graphApiVersion}
+         +/${config.phoneNumberId}/messages`;                            
+      16 +                                                               
+      17    return async function sendWhatsAppText(to, body) {
+      18      const res = await fetch(url, {
+      19        method: 'POST',
+     ...
+      22          'Content-Type': 'application/json',
+      23        },
+      24        body: JSON.stringify({ messaging_product: 'whatsapp', to,
+           type: 'text', text: { body } }),
+      19 -      signal: AbortSignal.timeout(10_000),                     
+      25 +      signal: AbortSignal.timeout(config.whatsappTimeoutMs),   
+      26      });
+      27      const data = await res.json().catch(() => null);
+      28      if (!res.ok) {
+
+● Now the handler (timeout outcome, optional phone-number check) and server (log
+  the real port, last-resort error logging).
+
+● Update(src\handler.js)  ⎿  Added 1 line, removed 1 line
+      44        for (const change of entry.changes || []) {
+      45          if (change.field !== 'messages') continue;
+      46          const value = change.value || {};
+      47 -        if (value.metadata?.phone_number_id !== config.phoneNum
+         -berId) {                                                       
+      47 +        if (config.phoneNumberId && value.metadata?.phone_numbe
+         +r_id !== config.phoneNumberId) {                               
+      48            log.warn(`[webhook] ignoring change for phone_number_
+          id ${value.metadata?.phone_number_id}`);
+      49            continue;
+      50          }
+
+● Update(src\handler.js)
+  ⎿  Added 7 lines
+       99          idempotencyKey: `wa-confirm/${wamid}`,
+      100        });
+      101      } catch (err) {
+      102 +      if (err.code === 'EMAIL_TIMEOUT') {                     
+      103 +        // Resend may still have accepted it. Don't tell the c
+          +lient it failed (they'd resend, risking a second email).      
+      104 +        log.error(`[email] ${wamid} outcome unknown: ${err.mes
+          +sage}`);                                                      
+      105 +        await mark(wamid, 'email_unknown', err.message);      
+      106 +        await reply(message.from, 'Thank you, we received your
+          + request. Our team will contact you within one working day.', 
+          +wamid);                                                       
+      107 +        return;                                               
+      108 +      }                                                       
+      109        log.error(`[email] ${wamid} failed: ${err.message}`);
+      110        await mark(wamid, 'email_failed', err.message);
+      111        await reply(
+
+● Update(src\server.js)
+  ⎿  Added 5 lines, removed 1 line
+      100    });
+      101    const app = createApp({ config, store, processor });
+      102  
+      103 +  // Last-resort guard: a failure in background work is logged
+          +, never allowed to take the service down.                     
+      104 +  process.on('unhandledRejection', (err) => console.error('[pr
+          +ocess] unhandled rejection:', err));                          
+      105 +                                                              
+      106    const server = app.listen(config.port, () => {
+      104 -    console.log(`Listening on ${config.port}${config.dryRun ? 
+          -' (DRY RUN: no emails or WhatsApp messages are sent)' : ''}`);
+      107 +    const port = server.address().port;                       
+      108 +    console.log(`Listening on ${port}${config.dryRun ? ' (DRY 
+          +RUN: no emails or WhatsApp messages are sent)' : ''}`);       
+      109    });
+      110  
+      111    let stopping = false;
+
+● Now the fake-Resend integration test. It starts the real npm start entry point
+  as a child process, points RESEND_BASE_URL and the Graph URL at a local fake
+  server, and counts email requests.
+
+● Write(test\fake-resend.test.js)
+  ⎿  Wrote 173 lines to test\fake-resend.test.js
+      1 // End-to-end: runs the real server (src/server.js, as `npm start
+        ` does) in a child process, with Resend pointed at a
+      2 // small fake HTTP server via RESEND_BASE_URL, and sends the sign
+        ed sample as Meta would.
+      3 const { test, after } = require('node:test');
+      4 const assert = require('node:assert/strict');
+      5 const http = require('http');
+      6 const fs = require('fs');
+      7 const path = require('path');
+      8 const { spawn } = require('child_process');
+     … +165 lines (ctrl+o to expand)
+
+● Update(test\webhook.test.js)
+  ⎿  Added 2 lines
+      158  
+      159  test('config fails fast on missing secrets and requires DATABA
+           SE_URL on Render', () => {
+      160    assert.throws(() => loadConfig({}), /META_VERIFY_TOKEN/);
+      161 +  // Locally, only the two Meta secrets are mandatory; missing
+          + delivery credentials just warn.                              
+      162 +  assert.doesNotThrow(() => loadConfig({ META_VERIFY_TOKEN: 'a
+          +', META_APP_SECRET: 'b' }, silentLog));                       
+      163    const base = {
+      164      META_VERIFY_TOKEN: 'a', META_APP_SECRET: 'b', WHATSAPP_PHO
+           NE_NUMBER_ID: 'c',
+      165      META_ACCESS_TOKEN: 'd', RESEND_API_KEY: 'e', RESEND_FROM: 
+           'f',
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All 13 pass. To prove the new test actually catches duplicates, I'll run it
+  once with deduplication disabled through a temporary patch in the scratchpad
+  (no project files touched). It should fail.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● The patch used a Git Bash path that Node can't resolve. Retrying with a
+  Windows path:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● With deduplication turned off, the test fails with 8 email requests instead of
+  1, so it does catch duplicates. Next I'll run the graders' exact scenario:
+  npm start with only the current .env against the real Resend and Meta
+  endpoints, using fake credentials. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● That matches what the graders will see. Last, documenting the new settings:
+
+● Update(.env.example)
+  ⎿  Added 6 lines
+      13  # Required on Render. Use the database's *Internal* URL.
+      14  DATABASE_URL=
+      15  
+      16 +# Optional tuning / test overrides                             
+      17 +RESEND_TIMEOUT_MS=10000                                        
+      18 +WHATSAPP_TIMEOUT_MS=10000                                      
+      19 +# RESEND_BASE_URL=http://127.0.0.1:4010   # point Resend at a f
+         +ake server (used by the tests)                                 
+      20 +# GRAPH_BASE_URL=http://127.0.0.1:4010    # same for the WhatsA
+         +pp Graph API                                                   
+      21 +                                                               
+      22  # true = log emails / WhatsApp replies instead of sending them 
+          (local testing)
+      23  DRY_RUN=false
+      24  PORT=3000
+
+● Update(README.md)
+  ⎿  Added 7 lines, removed 2 lines
+      17  
+      18  ## Run locally
+      19  
+      20 +Only `META_APP_SECRET` and `META_VERIFY_TOKEN` are required to 
+         +start. Missing or fake Resend / WhatsApp                       
+      21 +credentials don't stop the service: each send fails, is logged,
+         + and the message is still never retried.                       
+      22 +The Resend call times out after `RESEND_TIMEOUT_MS` (default 10
+         + s). The outcome is then logged as unknown and not retried.    
+      23 +                                                               
+      24      npm install
+      21 -    cp .env.example .env      # fill in values                 
+      22 -    npm run dev               # DRY RUN: logs emails / WhatsApp
+         - replies instead of sending them                               
+      25 +    npm start                 # uses .env                      
+      26      npm run send-sample       # in a second terminal: POSTs sam
+          ples/incoming-message.json signed with META_APP_SECRET
+      27  
+      28 +`npm run dev` does the same in DRY RUN mode: emails and WhatsAp
+         +p replies are logged instead of sent.                          
+      29 +                                                               
+      30  Useful variations:
+      31  
+      32      node scripts/send-sample.js --times=3    # same message 3x 
+          concurrently -> exactly one email
+
+● Update(README.md)
+  ⎿  Added 5 lines, removed 1 line
+      31  
+      32      node scripts/send-sample.js --times=3    # same message 3x 
+          concurrently -> exactly one email
+      33      node scripts/send-sample.js --tamper     # body altered aft
+          er signing -> 401
+      34 -    npm test                                 # automated tests 
+         -(no network, no database)                                      
+      34 +    npm test                                 # automated tests 
+         +(no real network, no database)                                 
+      35  
+      36 +`test/fake-resend.test.js` starts the real server as a child pr
+         +ocess with `RESEND_BASE_URL` (and `GRAPH_BASE_URL`)            
+      37 +pointed at a local fake server, delivers the signed sample 5x c
+         +oncurrently plus 3 more times, and asserts that                
+      38 +exactly one request reaches `POST /emails`.                    
+      39 +                                                               
+      40  Without `DATABASE_URL` the service uses an in-memory dedupe sto
+          re, which is fine locally but is lost on restart.
+      41  
+      42  ## Deploy on Render
+
+● npm start now runs with only the current .env, and the fake Resend and Meta
+  credentials fail without crashing anything. I ran the graders' scenario for
+  real: npm start with .env as it is, and the sample signed with META_APP_SECRET
+  sent 3 times at once and then once more. All four requests got 200 and only
+  one copy was processed. The log shows:
+
+  [email] wamid… failed: Resend error: validation_error: API key is invalid
+  [whatsapp] reply for wamid… failed: WhatsApp send failed (401): Malformed
+  access token …
+
+  /health still answered afterwards. All 13 tests pass.
+
+  Starting with only .env
+  - Only META_APP_SECRET and META_VERIFY_TOKEN are required now. Without
+    RESEND_FROM it warns and uses the default sender; without DATABASE_URL it
+    uses in-memory deduplication.
+  - If a Resend or WhatsApp credential is missing or rejected, that send fails
+    and is logged. The message is never retried, so a retry can't cause a
+    duplicate.
+  - On Render it still refuses to start without every credential plus
+    DATABASE_URL.
+
+  Resend timeout
+  - The call now stops waiting after RESEND_TIMEOUT_MS (10 seconds by default).
+  - The Resend SDK can't cancel its own request, so on timeout the email may
+    still have gone out. The service logs the outcome as unknown and doesn't
+    retry. It also doesn't tell the client the email failed, because the client
+    would just resend their address and could get a second email.
+  - One code change was needed for RESEND_BASE_URL to work from .env: the SDK
+    reads that setting only once, when it first loads. It now loads after .env
+    has been read.
+
+  New test (test/fake-resend.test.js)
+  - It starts the real server as a separate process, the same way npm start
+    does, with RESEND_BASE_URL pointing at a small fake server. A new
+    GRAPH_BASE_URL setting points the WhatsApp API there too, and that fake
+    rejects the token like Meta does.
+  - Main test: the signed sample is delivered 5 times at once, once more while
+    the email request may still be in progress, then twice after it finished.
+    Exactly one request reaches the fake POST /emails, carrying the right
+    address and idempotency key.
+  - Two more tests: a Resend 401 is logged and not retried, and a Resend that
+    never answers times out at 300 ms. In both the service keeps running.
+  - I also ran the main test once with deduplication switched off through a
+    temporary patch, without touching project files. It failed with 8 email
+    requests instead of 1, so the test does catch duplicates.
+
+  The new settings are documented in .env.example and the README. Nothing is
+  committed yet.
+
+> <ide_selection>The user selected the lines 6 to 6 from
+  c:\Users\Halby\Downloads\لسرت - رابتخالا تافلم
+  :starter\src\config.js\نيحشرملل
+  process.loadEnvFile
+
+  This may or may not be related to the current task.</ide_selection>
+
+> process.loadEnvFile only exists in Node 20.12+. Add a fallback using dotenv
+  package so .env loads on any Node version, without overriding variables that
+  are already set. Set engines.node to >=18. Then re-run the tests and run npm
+  start with only the provided .env, and send the signed sample to confirm it
+  still works.
+
+● I'll check that the dependencies support Node 18, then add the fallback.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All dependencies support Node 18. I installed dotenv 16 rather than 17,
+  because 17 prints a log line every time it loads. Now the fallback and the
+  engines field:
+
+● Update(src\config.js)
+  ⎿  Added 10 lines, removed 4 lines
+       1  const path = require('path');
+       2  
+       3  // Load .env for local runs. Variables already set in the envir
+          onment (e.g. by Render) are NOT overridden.
+       4 +// process.loadEnvFile exists only on Node >= 20.12 (and 21.7+)
+         +; older versions fall back to the dotenv package.              
+       5  function loadDotEnv(file = path.join(__dirname, '..', '.env')) 
+          {
+       5 -  try {                                                        
+       6 -    process.loadEnvFile(file);                                 
+       7 -  } catch (err) {                                              
+       8 -    if (err.code !== 'ENOENT') throw err;                      
+       6 +  if (typeof process.loadEnvFile === 'function') {             
+       7 +    try {                                                      
+       8 +      process.loadEnvFile(file);                               
+       9 +    } catch (err) {                                            
+      10 +      if (err.code !== 'ENOENT') throw err;                    
+      11 +    }                                                          
+      12 +    return;                                                    
+      13    }
+      14 +  const result = require('dotenv').config({ path: file, overrid
+         +e: false });                                                   
+      15 +  if (result.error && result.error.code !== 'ENOENT') throw res
+         +ult.error;                                                     
+      16  }
+      17  
+      18  const DEFAULT_FROM = 'Top Delmon <onboarding@resend.dev>';
+
+● Update(package.json)
+  ⎿  Added 1 line, removed 1 line
+       4    "description": "Receives client WhatsApp messages and sends a
+           confirmation email",
+       5    "main": "src/server.js",
+       6    "engines": {
+       7 -    "node": ">=20.12"                                          
+       7 +    "node": ">=18"                                             
+       8    },
+       9    "scripts": {
+      10      "start": "node src/server.js",
+
+● This machine has Node 24, so the dotenv branch never runs on its own. I'll add
+  a test that forces it by hiding process.loadEnvFile, and checks it doesn't
+  override existing variables.
+
+● Write(test\config.test.js)
+  ⎿  Wrote 53 lines to test\config.test.js
+       1 const { test } = require('node:test');
+       2 const assert = require('node:assert/strict');
+       3 const fs = require('fs');
+       4 const os = require('os');
+       5 const path = require('path');
+       6 const { loadDotEnv } = require('../src/config');
+       7
+       8 function withTempEnvFile(contents, fn) {
+       9   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'envtest-'))
+         ;
+     … +44 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All 17 tests pass; next I'm starting the service with only the provided .env,
+  running it both normally and with the built-in env loader removed to exercise
+  the dotenv fallback. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+● The dotenv-fallback run passed, but the native run tested nothing because port
+  3000 was already in use and the requests reached whatever process holds it.
+  I'm identifying that process before changing anything. · summary
+
+  Ran 1 shell command (ctrl+o to expand)
+  ⎿  Not run · permission denied
+     │ Reason: The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). The user provided the following reason for the …
+
+● The port looks free now, since the second run bound to it fine. I'm adding a
+  clear startup error for port conflicts, which currently crash with a raw stack
+  trace. · summary
+
+● Update(src\server.js)
+  ⎿  Added 8 lines
+      107      const port = server.address().port;
+      108      console.log(`Listening on ${port}${config.dryRun ? ' (DRY 
+           RUN: no emails or WhatsApp messages are sent)' : ''}`);
+      109    });
+      110 +  server.on('error', (err) => {                               
+      111 +    console.error(                                            
+      112 +      err.code === 'EADDRINUSE'                               
+      113 +        ? `Startup failed: port ${config.port} is already in u
+          +se (set PORT to use another one).`                            
+      114 +        : `Server error: ${err.message}`,                     
+      115 +    );                                                        
+      116 +    process.exit(1);                                          
+      117 +  });                                                         
+      118  
+      119    let stopping = false;
+      120    const shutdown = async (signal) => {
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● .env now loads on any supported Node version. On Node 20.12 and later it uses
+  the built-in process.loadEnvFile; on older versions it falls back to the
+  dotenv package. Neither overrides variables that are already set, so Render's
+  settings still win. engines.node is now >=18. All 17 tests pass, and npm start
+  with only the provided .env worked with the signed sample.
+
+  Changes
+  - src/config.js contains the fallback. I added dotenv@^16, because version 17
+    prints a log line every time it loads.
+  - The other dependencies all accept Node 18: resend needs ≥18, pg ≥16, express
+    any.
+  - test/config.test.js is new. It runs both loading paths, forcing the dotenv
+    one by hiding process.loadEnvFile. It checks that .env values load, that an
+    existing variable isn't overwritten, and that a missing .env is ignored.
+
+  npm start with only .env
+  I ran it twice: once normally, and once with process.loadEnvFile removed so it
+  went through dotenv. Both gave the same result:
+  - The verify token from .env echoed the challenge.
+  - The signed sample sent 3 times at once, then once more: all four got 200,
+    three were logged as duplicates, and only one email attempt was made.
+  - That attempt failed with API key is invalid and the WhatsApp reply failed
+    with a 401, as expected with the fake keys. Both were logged, and /health
+    still answered.
+  - A tampered body got 401.
+
+  Port 3000 was in use on the first try
+  On my first run something was already listening on port 3000, and the new
+  server crashed with a raw stack trace. I didn't look into what it was, as you
+  asked; the rerun had the port to itself and is the result above. I changed
+  src/server.js so a port conflict now stops with Startup failed: port 3000 is
+  already in use (set PORT to use another one).
+
+  I couldn't test on a real Node 18, because only Node 24 is installed here. The
+  fallback was checked by simulating an older Node.
+
+> List all the problems in original code and the fixes. Sort them by the type
+  like security, meta, etc.
+
+● Here are all 24 problems in the original code and what was done about each,
+  grouped by type. Two are not fully fixed (marked below), and the timeout row
+  comes from your later request rather than the original review.
+
+  Security
+
+  #: 1
+  Problem in the original: .env was staged for commit. .gitignore only listed
+    node_modules, so the first push would have put every secret in git history
+    permanently.
+  Fix: Removed .env from the index and added it to .gitignore. Added
+  .env.example
+    with placeholder values.
+  ────────────────────────────────────────
+  #: 2
+  Problem in the original: Meta's signature was never checked. META_APP_SECRET
+    was unused, so anyone with the URL could make the service email any address
+    under the "Top Delmon" name. express.json() also threw away the raw bytes
+  the
+     check needs.
+  Fix: X-Hub-Signature-256 is checked as an HMAC-SHA256 of the raw body, with a
+    constant-time compare. Unsigned, wrongly signed or altered requests get 401.
+  ────────────────────────────────────────
+  #: 3
+  Problem in the original: HTML injection in the email. The WhatsApp profile
+  name
+    and the message text went into the HTML unescaped.
+  Fix: Both are escaped, the quoted text is cut at 1000 characters, and a
+    plain-text version is included.
+  ────────────────────────────────────────
+  #: 4
+  Problem in the original: Verify-token bypass. With META_VERIFY_TOKEN unset, a
+    request with no token passed (undefined === undefined).
+  Fix: The token is required at startup and compared in constant time.
+  ────────────────────────────────────────
+  #: 5
+  Problem in the original: Open email relay. Any WhatsApp user can make the
+    service email any address with their text quoted.
+  Fix: Partly fixed: fake requests are blocked (#2) and the text is escaped and
+    shortened (#3). There is still no per-sender rate limit.
+
+  Duplicate emails
+
+  #: 6
+  Problem in the original: The main source of duplicates. If the email was sent
+    and the WhatsApp reply then failed, the service returned 500, Meta retried,
+    and the email went out again.
+  Fix: A failed WhatsApp reply is now only logged. It never causes a 500 or a
+    second email.
+  ────────────────────────────────────────
+  #: 7
+  Problem in the original: No record of handled messages. Meta can deliver the
+    same message more than once, and two simultaneous deliveries could both
+  send.
+  Fix: Each message id is recorded in one atomic step before Meta gets its
+    answer, in Postgres (in memory locally). A recorded id is never processed
+    again. The id is also sent to Resend as an Idempotency-Key.
+  ────────────────────────────────────────
+  #: 8
+  Problem in the original: Meta was answered only after the email and WhatsApp
+    calls finished. Slow answers make Meta retry.
+  Fix: Meta gets 200 as soon as the ids are recorded, and the work continues in
+    the background. If the database is down, the service returns 500 so Meta
+    retries later.
+  ────────────────────────────────────────
+  #: 9
+  Problem in the original: Remembering handled messages in memory wouldn't
+    survive Render (deploys, restarts, free-tier sleep).
+  Fix: Postgres is required on Render. The service refuses to start there
+  without
+    DATABASE_URL.
+
+  Meta (WhatsApp webhook)
+
+  #: 10
+  Problem in the original: The webhook could never be verified. It returned "OK"
+
+    instead of echoing hub.challenge.
+  Fix: It now echoes hub.challenge as plain text.
+  ────────────────────────────────────────
+  #: 11
+  Problem in the original: Only the first message in a request was handled; the
+    rest of a batch were silently dropped.
+  Fix: Every message in every entry is handled.
+  ────────────────────────────────────────
+  #: 12
+  Problem in the original: No payload checks. Event type and phone number id
+  were
+    never verified, and image or audio messages got the "send your email" reply.
+  Fix: Checks the event type and phone number id. Non-text messages and delivery
+
+    receipts are ignored.
+  ────────────────────────────────────────
+  #: 13
+  Problem in the original: WhatsApp sends were never checked. No status check,
+  no
+    timeout, and the API version v21.0 was hard-coded.
+  Fix: Checks the response, times out after 10 seconds, and failures are logged.
+
+    The version is a setting (default v24.0).
+
+  Resend (email)
+
+  #: 14
+  Problem in the original: Failed emails looked successful. emails.send()
+  returns
+    { data, error } instead of throwing, so the client was told "email sent"
+  even
+     when it failed.
+  Fix: The error is checked. Success needs an email id; otherwise the failure is
+
+    logged and the client is told it failed.
+  ────────────────────────────────────────
+  #: 15
+  Problem in the original: onboarding@resend.dev only delivers to the Resend
+    account owner, never to real clients.
+  Fix: The sender is set with RESEND_FROM. If it's missing locally, the service
+    warns and uses the default; on Render it is required.
+  ────────────────────────────────────────
+  #: 16
+  Problem in the original: Sentence-ending dots broke addresses.
+    "…fatima@example.com." captured the trailing dot, which Resend rejects.
+  Fix: New pattern that can't end on a dot, and the address is lowercased.
+  ────────────────────────────────────────
+  #: 17
+  Problem in the original: No timeout on the Resend call (added at your
+  request).
+  Fix: Times out after RESEND_TIMEOUT_MS (10 seconds by default). The outcome is
+
+    logged as unknown and the client isn't told it failed, so they don't resend
+    and get a second email.
+
+  Render and running locally
+
+  #: 18
+  Problem in the original: Port 3000 was hard-coded, but Render assigns the
+  port.
+  Fix: Uses PORT. A port that's already taken now gives a clear startup error.
+  ────────────────────────────────────────
+  #: 19
+  Problem in the original: .env was never loaded. Resend threw "Missing API key"
+
+    on startup, so npm start crashed immediately.
+  Fix: .env is loaded with process.loadEnvFile, falling back to dotenv on older
+    Node, without overriding existing variables. Only META_APP_SECRET and
+    META_VERIFY_TOKEN are required; fake or missing Resend and Meta credentials
+    are logged, not fatal.
+  ────────────────────────────────────────
+  #: 20
+  Problem in the original: No Node version was pinned, though the code needs
+    fetch (Node 18+).
+  Fix: engines.node is set to >=18.
+  ────────────────────────────────────────
+  #: 21
+  Problem in the original: No startup check for missing settings.
+  Fix: The service stops at startup and names the missing variables.
+  ────────────────────────────────────────
+  #: 22
+  Problem in the original: No graceful shutdown. Render stops the service on
+    every deploy and in-progress work would be lost.
+  Fix: On shutdown it stops taking requests, finishes background work, and then
+    exits.
+  ────────────────────────────────────────
+  #: 23
+  Problem in the original: Free-tier cold starts are slower than Meta's timeout,
+
+    which causes retries.
+  Fix: render.yaml uses a paid instance type that doesn't sleep. Deduplication
+    covers any retries that still happen.
+  ────────────────────────────────────────
+  #: 24
+  Problem in the original: package-lock.json was untracked, so Render builds
+    aren't reproducible.
+  Fix: Not done: it still needs to be committed.
+
+  Testing
+
+  #: 25
+  Problem in the original: No way to send a signed test message, and no tests.
+  Fix: npm run send-sample signs the exact sample bytes with the .env secret.
+    --times=N sends it N times at once; --tamper alters the body. npm test runs
+    17 tests.
+  ────────────────────────────────────────
+  #: 26
+  Problem in the original: Nothing proved "exactly one email".
+  Fix: A fake Resend server reached through RESEND_BASE_URL, with the real
+  server
+    running as a separate process. The sample is delivered 5 times at once plus
+  3
+     more, and exactly one email request arrives. With deduplication switched
+  off
+     the same test fails with 8 requests.
+
+  Still open
+
+  - Repeat addresses: a client who sends the same address in two separate
+    messages gets two emails.
+  - API version: confirm that WhatsApp API v24.0 is still supported.
+  - Postgres untested: check deduplication once on Render with a real database.
+    Locally only the in-memory version was tested.
+  - Git: nothing is committed yet, including package-lock.json.
+
+  I can also publish this as a shareable page if you want to send it to someone.
