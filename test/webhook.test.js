@@ -158,6 +158,8 @@ test('extractEmail drops sentence punctuation and lowercases', () => {
 
 test('config fails fast on missing secrets and requires DATABASE_URL on Render', () => {
   assert.throws(() => loadConfig({}), /META_VERIFY_TOKEN/);
+  // Locally, only the two Meta secrets are mandatory; missing delivery credentials just warn.
+  assert.doesNotThrow(() => loadConfig({ META_VERIFY_TOKEN: 'a', META_APP_SECRET: 'b' }, silentLog));
   const base = {
     META_VERIFY_TOKEN: 'a', META_APP_SECRET: 'b', WHATSAPP_PHONE_NUMBER_ID: 'c',
     META_ACCESS_TOKEN: 'd', RESEND_API_KEY: 'e', RESEND_FROM: 'f',

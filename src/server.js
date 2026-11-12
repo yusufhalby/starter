@@ -100,8 +100,12 @@ async function main() {
   });
   const app = createApp({ config, store, processor });
 
+  // Last-resort guard: a failure in background work is logged, never allowed to take the service down.
+  process.on('unhandledRejection', (err) => console.error('[process] unhandled rejection:', err));
+
   const server = app.listen(config.port, () => {
-    console.log(`Listening on ${config.port}${config.dryRun ? ' (DRY RUN: no emails or WhatsApp messages are sent)' : ''}`);
+    const port = server.address().port;
+    console.log(`Listening on ${port}${config.dryRun ? ' (DRY RUN: no emails or WhatsApp messages are sent)' : ''}`);
   });
 
   let stopping = false;

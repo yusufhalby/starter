@@ -6,7 +6,13 @@ function createWhatsAppSender(config, log = console) {
     };
   }
 
-  const url = `https://graph.facebook.com/${config.graphApiVersion}/${config.phoneNumberId}/messages`;
+  if (!config.accessToken || !config.phoneNumberId) {
+    return async () => {
+      throw new Error('META_ACCESS_TOKEN / WHATSAPP_PHONE_NUMBER_ID not configured');
+    };
+  }
+
+  const url = `${config.graphBaseUrl}/${config.graphApiVersion}/${config.phoneNumberId}/messages`;
 
   return async function sendWhatsAppText(to, body) {
     const res = await fetch(url, {
@@ -16,7 +22,7 @@ function createWhatsAppSender(config, log = console) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body } }),
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(config.whatsappTimeoutMs),
     });
     const data = await res.json().catch(() => null);
     if (!res.ok) {

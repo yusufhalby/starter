@@ -17,16 +17,25 @@ email through Resend.
 
 ## Run locally
 
+Only `META_APP_SECRET` and `META_VERIFY_TOKEN` are required to start. Missing or fake Resend / WhatsApp
+credentials don't stop the service: each send fails, is logged, and the message is still never retried.
+The Resend call times out after `RESEND_TIMEOUT_MS` (default 10 s). The outcome is then logged as unknown and not retried.
+
     npm install
-    cp .env.example .env      # fill in values
-    npm run dev               # DRY RUN: logs emails / WhatsApp replies instead of sending them
+    npm start                 # uses .env
     npm run send-sample       # in a second terminal: POSTs samples/incoming-message.json signed with META_APP_SECRET
+
+`npm run dev` does the same in DRY RUN mode: emails and WhatsApp replies are logged instead of sent.
 
 Useful variations:
 
     node scripts/send-sample.js --times=3    # same message 3x concurrently -> exactly one email
     node scripts/send-sample.js --tamper     # body altered after signing -> 401
-    npm test                                 # automated tests (no network, no database)
+    npm test                                 # automated tests (no real network, no database)
+
+`test/fake-resend.test.js` starts the real server as a child process with `RESEND_BASE_URL` (and `GRAPH_BASE_URL`)
+pointed at a local fake server, delivers the signed sample 5x concurrently plus 3 more times, and asserts that
+exactly one request reaches `POST /emails`.
 
 Without `DATABASE_URL` the service uses an in-memory dedupe store, which is fine locally but is lost on restart.
 

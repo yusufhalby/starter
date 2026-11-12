@@ -44,7 +44,7 @@ function createProcessor({ config, store, sendEmail, sendWhatsApp, log = console
       for (const change of entry.changes || []) {
         if (change.field !== 'messages') continue;
         const value = change.value || {};
-        if (value.metadata?.phone_number_id !== config.phoneNumberId) {
+        if (config.phoneNumberId && value.metadata?.phone_number_id !== config.phoneNumberId) {
           log.warn(`[webhook] ignoring change for phone_number_id ${value.metadata?.phone_number_id}`);
           continue;
         }
@@ -99,6 +99,13 @@ function createProcessor({ config, store, sendEmail, sendWhatsApp, log = console
         idempotencyKey: `wa-confirm/${wamid}`,
       });
     } catch (err) {
+      if (err.code === 'EMAIL_TIMEOUT') {
+        // Resend may still have accepted it. Don't tell the client it failed (they'd resend, risking a second email).
+        log.error(`[email] ${wamid} outcome unknown: ${err.message}`);
+        await mark(wamid, 'email_unknown', err.message);
+        await reply(message.from, 'Thank you, we received your request. Our team will contact you within one working day.', wamid);
+        return;
+      }
       log.error(`[email] ${wamid} failed: ${err.message}`);
       await mark(wamid, 'email_failed', err.message);
       await reply(
