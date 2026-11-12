@@ -4,7 +4,7 @@
   "description": "Receives client WhatsApp messages and sends a confirmation email",
   "main": "src/server.js",
   "engines": {
-    "node": ">=20.12"
+    "node": ">=18"
   },
   "scripts": {
     "start": "node src/server.js",
@@ -13,6 +13,7 @@
     "test": "node --test"
   },
   "dependencies": {
+    "dotenv": "^16.6.1",
     "express": "^4.22.3",
     "pg": "^8.23.1",
     "resend": "^4.8.0"

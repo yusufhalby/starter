@@ -107,6 +107,14 @@ async function main() {
     const port = server.address().port;
     console.log(`Listening on ${port}${config.dryRun ? ' (DRY RUN: no emails or WhatsApp messages are sent)' : ''}`);
   });
+  server.on('error', (err) => {
+    console.error(
+      err.code === 'EADDRINUSE'
+        ? `Startup failed: port ${config.port} is already in use (set PORT to use another one).`
+        : `Server error: ${err.message}`,
+    );
+    process.exit(1);
+  });
 
   let stopping = false;
   const shutdown = async (signal) => {

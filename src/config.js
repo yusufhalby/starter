@@ -1,12 +1,18 @@
 const path = require('path');
 
 // Load .env for local runs. Variables already set in the environment (e.g. by Render) are NOT overridden.
+// process.loadEnvFile exists only on Node >= 20.12 (and 21.7+); older versions fall back to the dotenv package.
 function loadDotEnv(file = path.join(__dirname, '..', '.env')) {
-  try {
-    process.loadEnvFile(file);
-  } catch (err) {
-    if (err.code !== 'ENOENT') throw err;
+  if (typeof process.loadEnvFile === 'function') {
+    try {
+      process.loadEnvFile(file);
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+    return;
   }
+  const result = require('dotenv').config({ path: file, override: false });
+  if (result.error && result.error.code !== 'ENOENT') throw result.error;
 }
 
 const DEFAULT_FROM = 'Top Delmon <onboarding@resend.dev>';
