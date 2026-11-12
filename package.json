@@ -3,6 +3,18 @@
   "version": "1.0.0",
   "description": "Receives client WhatsApp messages and sends a confirmation email",
   "main": "src/server.js",
-  "scripts": { "start": "node src/server.js" },
-  "dependencies": { "express": "^4.19.2", "resend": "^4.0.0" }
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js --dry-run",
+    "send-sample": "node scripts/send-sample.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "express": "^4.22.3",
+    "pg": "^8.23.1",
+    "resend": "^4.8.0"
+  }
 }
